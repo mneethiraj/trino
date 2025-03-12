@@ -47,6 +47,7 @@ import io.trino.plugin.hive.HiveWrittenPartitions;
 import io.trino.plugin.iceberg.aggregation.DataSketchStateSerializer;
 import io.trino.plugin.iceberg.aggregation.IcebergThetaSketchForStats;
 import io.trino.plugin.iceberg.catalog.TrinoCatalog;
+import io.trino.plugin.iceberg.functions.IcebergFunctionProvider;
 import io.trino.plugin.iceberg.procedure.IcebergAddFilesFromTableHandle;
 import io.trino.plugin.iceberg.procedure.IcebergAddFilesHandle;
 import io.trino.plugin.iceberg.procedure.IcebergDropExtendedStatsHandle;
@@ -109,6 +110,11 @@ import io.trino.spi.connector.WriterScalingOptions;
 import io.trino.spi.expression.ConnectorExpression;
 import io.trino.spi.expression.FunctionName;
 import io.trino.spi.expression.Variable;
+import io.trino.spi.function.BoundSignature;
+import io.trino.spi.function.FunctionDependencyDeclaration;
+import io.trino.spi.function.FunctionId;
+import io.trino.spi.function.FunctionMetadata;
+import io.trino.spi.function.SchemaFunctionName;
 import io.trino.spi.predicate.Domain;
 import io.trino.spi.predicate.NullableValue;
 import io.trino.spi.predicate.TupleDomain;
@@ -233,6 +239,7 @@ import static com.google.common.collect.Iterables.getLast;
 import static com.google.common.collect.Iterables.getOnlyElement;
 import static com.google.common.collect.Maps.transformValues;
 import static com.google.common.collect.Sets.difference;
+import static io.trino.filesystem.Locations.isS3Tables;
 import static io.trino.plugin.base.filter.UtcConstraintExtractor.extractTupleDomain;
 import static io.trino.plugin.base.projection.ApplyProjectionUtil.extractSupportedProjectedColumns;
 import static io.trino.plugin.base.projection.ApplyProjectionUtil.replaceWithNewVariables;
@@ -254,6 +261,7 @@ import static io.trino.plugin.iceberg.IcebergColumnHandle.TRINO_MERGE_PARTITION_
 import static io.trino.plugin.iceberg.IcebergColumnHandle.TRINO_MERGE_ROW_ID;
 import static io.trino.plugin.iceberg.IcebergColumnHandle.TRINO_ROW_ID_NAME;
 import static io.trino.plugin.iceberg.IcebergColumnHandle.fileModifiedTimeColumnHandle;
+import static io.trino.plugin.iceberg.IcebergColumnHandle.partitionColumnHandle;
 import static io.trino.plugin.iceberg.IcebergColumnHandle.pathColumnHandle;
 import static io.trino.plugin.iceberg.IcebergErrorCode.ICEBERG_CATALOG_ERROR;
 import static io.trino.plugin.iceberg.IcebergErrorCode.ICEBERG_COMMIT_ERROR;
@@ -263,6 +271,7 @@ import static io.trino.plugin.iceberg.IcebergErrorCode.ICEBERG_MISSING_METADATA;
 import static io.trino.plugin.iceberg.IcebergErrorCode.ICEBERG_UNSUPPORTED_VIEW_DIALECT;
 import static io.trino.plugin.iceberg.IcebergMetadataColumn.FILE_MODIFIED_TIME;
 import static io.trino.plugin.iceberg.IcebergMetadataColumn.FILE_PATH;
+import static io.trino.plugin.iceberg.IcebergMetadataColumn.PARTITION;
 import static io.trino.plugin.iceberg.IcebergMetadataColumn.isMetadataColumnId;
 import static io.trino.plugin.iceberg.IcebergPartitionFunction.Transform.BUCKET;
 import static io.trino.plugin.iceberg.IcebergSessionProperties.getExpireSnapshotMinRetention;
@@ -419,6 +428,7 @@ public class IcebergMetadata
             .add(PARTITIONING_PROPERTY)
             .add(SORTED_BY_PROPERTY)
             .build();
+    private static final String SYSTEM_SCHEMA = "system";
 
     public static final String NUMBER_OF_DISTINCT_VALUES_NAME = "NUMBER_OF_DISTINCT_VALUES";
     private static final FunctionName NUMBER_OF_DISTINCT_VALUES_FUNCTION = new FunctionName(IcebergThetaSketchForStats.NAME);
@@ -468,6 +478,32 @@ public class IcebergMetadata
         this.allowedExtraProperties = requireNonNull(allowedExtraProperties, "allowedExtraProperties is null");
         this.icebergScanExecutor = requireNonNull(icebergScanExecutor, "icebergScanExecutor is null");
         this.metadataFetchingExecutor = requireNonNull(metadataFetchingExecutor, "metadataFetchingExecutor is null");
+    }
+
+    @Override
+    public Collection<FunctionMetadata> listFunctions(ConnectorSession session, String schemaName)
+    {
+        return schemaName.equals(SYSTEM_SCHEMA) ? IcebergFunctionProvider.FUNCTIONS : List.of();
+    }
+
+    @Override
+    public Collection<FunctionMetadata> getFunctions(ConnectorSession session, SchemaFunctionName name)
+    {
+        if (!name.getSchemaName().equals(SYSTEM_SCHEMA)) {
+            return List.of();
+        }
+        return IcebergFunctionProvider.FUNCTIONS.stream()
+                .filter(function -> function.getCanonicalName().equals(name.getFunctionName()))
+                .toList();
+    }
+
+    @Override
+    public FunctionMetadata getFunctionMetadata(ConnectorSession session, FunctionId functionId)
+    {
+        return IcebergFunctionProvider.FUNCTIONS.stream()
+                .filter(function -> function.getFunctionId().equals(functionId))
+                .findFirst()
+                .orElseThrow();
     }
 
     @Override
@@ -711,7 +747,7 @@ public class IcebergMetadata
 
         // Only when dealing with an actual system table proceed to retrieve the base table for the system table
         String name = tableNameFrom(tableName.getTableName());
-        Table table;
+        BaseTable table;
         try {
             table = catalog.loadTable(session, new SchemaTableName(tableName.getSchemaName(), name));
         }
@@ -917,6 +953,7 @@ public class IcebergMetadata
         for (IcebergColumnHandle columnHandle : getTopLevelColumns(SchemaParser.fromJson(table.getTableSchemaJson()), typeManager)) {
             columnHandles.put(columnHandle.getName(), columnHandle);
         }
+        columnHandles.put(PARTITION.getColumnName(), partitionColumnHandle());
         columnHandles.put(FILE_PATH.getColumnName(), pathColumnHandle());
         columnHandles.put(FILE_MODIFIED_TIME.getColumnName(), fileModifiedTimeColumnHandle());
         return columnHandles.buildOrThrow();
@@ -1231,12 +1268,15 @@ public class IcebergMetadata
         }
         transaction = newCreateTableTransaction(catalog, tableMetadata, session, replace, tableLocation, allowedExtraProperties);
         Location location = Location.of(transaction.table().location());
-        TrinoFileSystem fileSystem = fileSystemFactory.create(session.getIdentity(), transaction.table().io().properties());
         try {
-            if (!replace && fileSystem.listFiles(location).hasNext()) {
-                throw new TrinoException(ICEBERG_FILESYSTEM_ERROR, format("" +
-                        "Cannot create a table on a non-empty location: %s, set 'iceberg.unique-table-location=true' in your Iceberg catalog properties " +
-                        "to use unique table locations for every table.", location));
+            // S3 Tables internally assigns a unique location for each table
+            if (!isS3Tables(location.toString())) {
+                TrinoFileSystem fileSystem = fileSystemFactory.create(session.getIdentity(), transaction.table().io().properties());
+                if (!replace && fileSystem.listFiles(location).hasNext()) {
+                    throw new TrinoException(ICEBERG_FILESYSTEM_ERROR, format("" +
+                            "Cannot create a table on a non-empty location: %s, set 'iceberg.unique-table-location=true' in your Iceberg catalog properties " +
+                            "to use unique table locations for every table.", location));
+                }
             }
             return newWritableTableHandle(tableMetadata.getTable(), transaction.table(), retryMode);
         }
@@ -1462,7 +1502,10 @@ public class IcebergMetadata
         beforeWriteSnapshotId.ifPresent(previous ->
                 verify(previous != newSnapshotId, "Failed to get new snapshot ID"));
 
-        if (!computedStatistics.isEmpty()) {
+        if (isS3Tables(icebergTable.location())) {
+            log.debug("S3 Tables does not support statistics: %s", table.name());
+        }
+        else if (!computedStatistics.isEmpty()) {
             try {
                 beginTransaction(catalog.loadTable(session, table.name()));
                 Table reloadedTable = transaction.table();
@@ -1474,7 +1517,7 @@ public class IcebergMetadata
                         INCREMENTAL_UPDATE,
                         collectedStatistics);
                 transaction.updateStatistics()
-                        .setStatistics(newSnapshotId, statisticsFile)
+                        .setStatistics(statisticsFile)
                         .commit();
 
                 commitTransaction(transaction, "update statistics on insert");
@@ -1986,7 +2029,7 @@ public class IcebergMetadata
             StatisticsFile newStatsFile = tableStatisticsWriter.rewriteStatisticsFile(session, reloadedTable, newSnapshotId);
 
             transaction.updateStatistics()
-                    .setStatistics(newSnapshotId, newStatsFile)
+                    .setStatistics(newStatsFile)
                     .commit();
             commitTransaction(transaction, "update statistics after optimize");
         }
@@ -2317,6 +2360,12 @@ public class IcebergMetadata
         catch (IOException e) {
             throw new TrinoException(ICEBERG_FILESYSTEM_ERROR, "Failed accessing data for table: " + schemaTableName, e);
         }
+    }
+
+    @Override
+    public FunctionDependencyDeclaration getFunctionDependencies(ConnectorSession session, FunctionId functionId, BoundSignature boundSignature)
+    {
+        return FunctionDependencyDeclaration.NO_DEPENDENCIES;
     }
 
     @Override
@@ -2901,6 +2950,9 @@ public class IcebergMetadata
     {
         IcebergTableHandle handle = (IcebergTableHandle) tableHandle;
         Table icebergTable = catalog.loadTable(session, handle.getSchemaTableName());
+        if (isS3Tables(icebergTable.location())) {
+            throw new TrinoException(NOT_SUPPORTED, "S3 Tables does not support analyze");
+        }
         beginTransaction(icebergTable);
         return handle;
     }
@@ -2931,7 +2983,7 @@ public class IcebergMetadata
                 REPLACE,
                 collectedStatistics);
         transaction.updateStatistics()
-                .setStatistics(snapshotId, statisticsFile)
+                .setStatistics(statisticsFile)
                 .commit();
 
         commitTransaction(transaction, "statistics collection");
@@ -3327,7 +3379,7 @@ public class IcebergMetadata
                     newEnforced.put(columnHandle, domain);
                 }
                 else if (isMetadataColumnId(columnHandle.getId())) {
-                    if (columnHandle.isPathColumn() || columnHandle.isFileModifiedTimeColumn()) {
+                    if (columnHandle.isPartitionColumn() || columnHandle.isPathColumn() || columnHandle.isFileModifiedTimeColumn()) {
                         newEnforced.put(columnHandle, domain);
                     }
                     else {
